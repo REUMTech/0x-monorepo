@@ -156,7 +156,8 @@ describe('Exchange transactions', () => {
                     signedOrder.signature,
                 );
                 const signedTx = transactionFactory.newSignedTransaction(data);
-                await exWrapper.executeTransactionAsync(signedTx, senderAddress);
+                const tx = await exWrapper.executeTransactionAsync(signedTx, senderAddress);
+
                 const newBalances = await dmyBalances.getAsync();
 
                 const makerTokenFillAmount = takerTokenFillAmount

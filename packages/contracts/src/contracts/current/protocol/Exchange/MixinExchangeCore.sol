@@ -23,10 +23,10 @@ pragma experimental "v0.5.0";
 import "./mixins/MExchangeCore.sol";
 import "./mixins/MSettlement.sol";
 import "./mixins/MSignatureValidator.sol";
-import "./mixins/MTransactions.sol";
 import "./LibOrder.sol";
 import "./LibErrors.sol";
 import "./LibPartialAmount.sol";
+import "./LibExchangeDecoder.sol";
 import "../../utils/SafeMath/SafeMath.sol";
 
 /// @dev Provides MExchangeCore
@@ -37,11 +37,14 @@ contract MixinExchangeCore is
     MExchangeCore,
     MSettlement,
     MSignatureValidator,
-    MTransactions,
     SafeMath,
     LibErrors,
-    LibPartialAmount
+    LibPartialAmount,
+    LibExchangeDecoder
 {
+    // Mapping of transaction hash => executed
+    mapping (bytes32 => bool) public transactions;
+
     // Mappings of orderHash => amounts of takerTokenAmount filled or cancelled.
     mapping (bytes32 => uint256) public filled;
     mapping (bytes32 => uint256) public cancelled;
@@ -82,6 +85,38 @@ contract MixinExchangeCore is
     * Core exchange functions
     */
 
+    /// @dev Executes an exchange method call in the context of signer.
+    /// @param salt Arbitrary number to ensure uniqueness of transaction hash.
+    /// @param signer Address of transaction signer.
+    /// @param data AbiV2 encoded calldata.
+    /// @param signature Proof that transaction has been signed.
+    function executeTransaction(
+        uint256 salt,
+        address signer,
+        bytes data,
+        bytes signature)
+        external
+    {
+        // Calculate transaction hash
+        bytes32 transactionHash = keccak256(salt, data);
+
+        // Validate transaction has not been executed
+        require(!transactions[transactionHash]);
+
+        // Validate signature
+        require(isValidSignature(transactionHash, signer, signature));
+
+        // Execute transaction
+        transactions[transactionHash] = true;
+        if (getFunctionSelector(data) == this.fillOrder.selector) {
+            Order memory order;
+            uint256 takerTokenFillAmount;
+            bytes memory makerSignature;
+            (order, takerTokenFillAmount, makerSignature) = getFillOrderArgs(data);
+            fillOrderInternal(signer, order, takerTokenFillAmount, makerSignature);
+        }
+    }
+
     /// @dev Fills the input order.
     /// @param order Order struct containing order specifications.
     /// @param takerTokenFillAmount Desired amount of takerToken to fill.
@@ -92,6 +127,82 @@ contract MixinExchangeCore is
         uint256 takerTokenFillAmount,
         bytes signature)
         public
+        returns (uint256 takerTokenFilledAmount)
+    {
+       return fillOrderInternal(
+           msg.sender,
+           order,
+           takerTokenFillAmount,
+           signature
+        );
+    }
+
+    /// @dev Cancels the input order.
+    /// @param order Order struct containing order specifications.
+    /// @param takerTokenCancelAmount Desired amount of takerToken to cancel in order.
+    /// @return Amount of takerToken cancelled.
+    function cancelOrder(
+        Order order,
+        uint256 takerTokenCancelAmount)
+        public
+        returns (uint256 takerTokenCancelledAmount)
+    {
+        return cancelOrderInternal(
+            msg.sender,
+            order,
+            takerTokenCancelAmount
+        );
+    }
+
+    /// @param salt Orders created with a salt less or equal to this value will be cancelled.
+    function cancelOrdersUpTo(uint256 salt)
+        external
+    {
+        uint256 newMakerEpoch = salt + 1;                // makerEpoch is initialized to 0, so to cancelUpTo we need salt+1
+        require(newMakerEpoch > makerEpoch[msg.sender]); // epoch must be monotonically increasing
+        makerEpoch[msg.sender] = newMakerEpoch;
+        emit CancelUpTo(msg.sender, newMakerEpoch);
+    }
+
+    /// @dev Checks if rounding error > 0.1%.
+    /// @param numerator Numerator.
+    /// @param denominator Denominator.
+    /// @param target Value to multiply with numerator/denominator.
+    /// @return Rounding error is present.
+    function isRoundingError(uint256 numerator, uint256 denominator, uint256 target)
+        public pure
+        returns (bool isError)
+    {
+        uint256 remainder = mulmod(target, numerator, denominator);
+        if (remainder == 0) {
+            return false; // No rounding error.
+        }
+
+        uint256 errPercentageTimes1000000 = safeDiv(
+            safeMul(remainder, 1000000),
+            safeMul(numerator, target)
+        );
+        isError = errPercentageTimes1000000 > 1000;
+        return isError;
+    }
+
+    /// @dev Calculates the sum of values already filled and cancelled for a given order.
+    /// @param orderHash The Keccak-256 hash of the given order.
+    /// @return Sum of values already filled and cancelled.
+    function getUnavailableTakerTokenAmount(bytes32 orderHash)
+        public view
+        returns (uint256 unavailableTakerTokenAmount)
+    {
+        unavailableTakerTokenAmount = safeAdd(filled[orderHash], cancelled[orderHash]);
+        return unavailableTakerTokenAmount;
+    }
+
+    function fillOrderInternal(
+        address takerAddress,
+        Order memory order,
+        uint256 takerTokenFillAmount,
+        bytes memory signature)
+        internal
         returns (uint256 takerTokenFilledAmount)
     {
         // Compute the order hash
@@ -111,7 +222,6 @@ contract MixinExchangeCore is
         }
 
         // Validate transaction signed by taker
-        address takerAddress = getSignerAddress();
         if (order.takerAddress != address(0)) {
             require(order.takerAddress == takerAddress);
         }
@@ -169,14 +279,11 @@ contract MixinExchangeCore is
         return takerTokenFilledAmount;
     }
 
-    /// @dev Cancels the input order.
-    /// @param order Order struct containing order specifications.
-    /// @param takerTokenCancelAmount Desired amount of takerToken to cancel in order.
-    /// @return Amount of takerToken cancelled.
-    function cancelOrder(
+    function cancelOrderInternal(
+        address makerAddress,
         Order order,
         uint256 takerTokenCancelAmount)
-        public
+        internal
         returns (uint256 takerTokenCancelledAmount)
     {
         // Compute the order hash
@@ -193,7 +300,6 @@ contract MixinExchangeCore is
         }
         
         // Validate transaction signed by maker
-        address makerAddress = getSignerAddress();
         require(order.makerAddress == makerAddress);
         
         if (block.timestamp >= order.expirationTimeSeconds) {
@@ -223,48 +329,5 @@ contract MixinExchangeCore is
             orderHash
         );
         return takerTokenCancelledAmount;
-    }
-
-    /// @param salt Orders created with a salt less or equal to this value will be cancelled.
-    function cancelOrdersUpTo(uint256 salt)
-        external
-    {
-        uint256 newMakerEpoch = salt + 1;                // makerEpoch is initialized to 0, so to cancelUpTo we need salt+1
-        require(newMakerEpoch > makerEpoch[msg.sender]); // epoch must be monotonically increasing
-        makerEpoch[msg.sender] = newMakerEpoch;
-        emit CancelUpTo(msg.sender, newMakerEpoch);
-    }
-
-    /// @dev Checks if rounding error > 0.1%.
-    /// @param numerator Numerator.
-    /// @param denominator Denominator.
-    /// @param target Value to multiply with numerator/denominator.
-    /// @return Rounding error is present.
-    function isRoundingError(uint256 numerator, uint256 denominator, uint256 target)
-        public pure
-        returns (bool isError)
-    {
-        uint256 remainder = mulmod(target, numerator, denominator);
-        if (remainder == 0) {
-            return false; // No rounding error.
-        }
-
-        uint256 errPercentageTimes1000000 = safeDiv(
-            safeMul(remainder, 1000000),
-            safeMul(numerator, target)
-        );
-        isError = errPercentageTimes1000000 > 1000;
-        return isError;
-    }
-
-    /// @dev Calculates the sum of values already filled and cancelled for a given order.
-    /// @param orderHash The Keccak-256 hash of the given order.
-    /// @return Sum of values already filled and cancelled.
-    function getUnavailableTakerTokenAmount(bytes32 orderHash)
-        public view
-        returns (uint256 unavailableTakerTokenAmount)
-    {
-        unavailableTakerTokenAmount = safeAdd(filled[orderHash], cancelled[orderHash]);
-        return unavailableTakerTokenAmount;
     }
 }
