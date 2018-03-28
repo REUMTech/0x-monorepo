@@ -1,5 +1,9 @@
 # CHANGELOG
 
+## v0.3.4 - _TBD, 2018_
+
+    * Don't try to write contract artifact if the error occured (#485)
+
 ## v0.3.1 - _March 18, 2018_
 
     * Add TS types for `yargs`

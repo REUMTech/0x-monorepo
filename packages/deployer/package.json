@@ -57,7 +57,6 @@
         "nyc": "^11.0.1",
         "shx": "^0.2.2",
         "tslint": "5.8.0",
-        "types-bn": "^0.0.1",
         "typedoc": "0xProject/typedoc",
         "typescript": "2.7.1",
         "web3-typescript-typings": "^0.10.2"
